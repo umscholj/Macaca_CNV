@@ -1,0 +1,162 @@
+import matplotlib.pyplot as plt
+import pandas as pd
+import subprocess
+import sys
+import numpy as np
+import matplotlib.patches as patches
+import glob
+import gzip
+import fileinput
+from scipy import stats
+import math
+
+def count_lines(f):
+    lineCount = 0
+    with open(f, 'r') as f:
+        for line in f:
+            lineCount += 1
+        return lineCount
+def runCMD(cmd):
+    val = subprocess.Popen(cmd, shell=True).wait()
+    if val == 0:
+        pass
+    else:
+        print ('command failed')
+        print (cmd)
+        sys.exit(1)
+
+def get_in_file(a):    
+    return glob.glob(a) 
+
+def format_bed_file(a):
+    bedfile = a + '.bed'
+# leave out header line and duplications on chrUn
+    cmd1 = 'grep -v "chromo" %s | grep -v "chrUn" > %s' % (a, bedfile)
+    runCMD(cmd1)
+# change the chromosome names to be consistent with the ensGene bed file
+    cmd2 = 'for i in {1..20}; do sed -i "s/chr${i}/${i}/g" %s; done' % (bedfile)
+    runCMD(cmd2)
+    cmd3 = 'sed -i "s/chrX/X/g" %s' % (bedfile)
+    runCMD(cmd3)
+    cmd4 = 'sed -i "s/chrY/Y/g" %s' % (bedfile)
+    runCMD(cmd4)
+    cmd5 = 'sed -i "s/chrM/MT/g" %s' % (bedfile)
+    runCMD(cmd5)
+    return bedfile
+
+
+def do_intersects(a, b, outfile):
+## a, b are duplication/CNV bedfiles and gene bedfile, separately
+    cmd = 'bedtools intersect -wo -a %s -b %s > %s' % (a, b, outfile)
+    #print(cmd)
+    runCMD(cmd)
+    Dict = process_intersect(outfile)
+    return Dict
+    
+########################################################################################
+def process_intersect(outfile):
+    Dict={}
+    linecount = 0
+    for line in open(outfile,'r'):
+        linecount += 1
+        line=line.rstrip().split()
+        chrom,start,end = line[0:3]
+        ID = '_'.join(line[0:3])
+        hitID = line[19]
+        if ID in Dict.keys():
+            Dict[ID].append(hitID)
+        else:
+            Dict[ID] = []
+            Dict[ID].append(hitID)
+    return Dict
+
+def do_window_intersects(a,b,windowSize,outfile):
+    cmd = 'bedtools window -w %i -a %s -b %s > %s' % (windowSize, a, b, outfile)
+    #print(cmd)
+    runCMD(cmd)
+    
+def parse_gene_intersect_file(Dict,intfile,windowLength):
+    intersectFile = open(intfile,'r') #outfile from the intersect step with ensembl 92 genes
+    ensID = ''
+    sigGenes = [] #To keep track of all gene IDs (ENSMMUG) that are in sig windows
+    geneLengths = [] #A list to keep the lengths information of all intersected genes
+    
+    #Reading the intersect file results
+    for line in intersectFile:
+        line = line.rstrip() #removing extraneous whitespace characters
+        line = line.split('\t') #delimiting "columns" in the file based on tabs     
+        winID = '_'.join(line[0:3])
+        ensGID = line[19]
+        Dict.setdefault(winID, []).append(ensGID)
+        geneLength = int(line[18]) - int(line[17])
+        geneLengths.append(geneLength) #A list to keep the lengths information of all intersected genes
+    intersectFile.close()      
+    return Dict, geneLengths
+
+def parse_shuffle_intersect(Dict,intfile, windowSize): 
+    intersectFile = open(intfile,'r') #outfile from the intersect step with ensembl 92 genes
+    geneLengths = [] # a list keeping track of intersected gene lengths for shuffled duplications (one round shuffling)
+    
+    #Reading the intersect file results
+    for line in intersectFile:
+        line = line.rstrip() #removing extraneous whitespace characters
+        line = line.split('\t') #delimiting "columns" in the file based on tabs     
+        winID = '_'.join(line[0:3])
+        ensGID = line[19]
+        if winID in Dict.keys():
+            Dict[winID].append(ensGID)
+        else:
+            Dict[winID] = []
+            Dict[winID].append(ensGID) 
+        geneLength = int(line[18]) - int(line[17])
+        geneLengths.append(geneLength) # a list keeping track of intersected gene lengths for shuffled duplications (one round shuffling)
+    intersectFile.close()  
+    return Dict, geneLengths
+
+# Make dictionaries to save the key information of intersection results and intersected gene lengths
+Intersection_Summary_Dict = {}
+real_geneLengths_Dict = {}
+
+## Write shuffled duplication bedfiles in the following directory
+workDir = '/scratch/jmkidd_fluxod/umscholj/controls/window-counts/1kb_window/'
+
+#Do 1000 bedtools shuffles 
+
+dupBedFile = workDir + 'CNV_all_1kb_CN.withoutBM.sorted.merged.calling2nd.full.gt2.bed'
+dupBedFile = workDir + 'fixed_dups/fixed_duplications_1kb_withoutBM.sorted.merged.screened2nd.gt2.details.bed'
+#dupBedFile = workDir + 'dup_CNV_all_1kb_CN.withoutBM.sorted.merged.calling2nd.full.gt2.bed'
+#dupBedFile = workDir + 'del_CNV_all_1kb_CN.withoutBM.sorted.merged.calling2nd.full.gt2.bed'
+#mmulGenome = '/scratch/jmkidd_fluxod/umscholj/controls/window-counts/1kb_window/rheMac8.autosomesOnly.genome'
+mmulGenome = '/scratch/jmkidd_fluxod/umscholj/controls/window-counts/1kb_window/rheMac8.genome'   ### 20181104: autosomes + chrX
+
+file = dupBedFile.split('/')[-1].split('_1kb')[0]
+
+#windowSizeList = [0, 5000, 10000]
+windowSizeList = [5000]    ### abandoning 0kb, 10kb window intersection for their results are harder to interpret
+for windowSize in windowSizeList:
+    windowHitCounts, geneHitCounts  = [], [] # a list to save the numbers of windows intersecting with genes; a list to save the numbers of genes within the extended or not duplication regions
+    total_perm_geneLengths, perm_averageGeneLengths = [], [] # a list to keep track of all intersected gene lengths for 1000 permutations/shufflings; a list to keep track of 1000 mean values of intersected gene lengths for 1000 permutations
+    for i in range(0,1000):
+        #Shuffle the coordinates
+        shuffledFile = workDir + 'permutations/%s_shuffle_%i.txt' % (file, i)
+        cmd = 'bedtools shuffle -i %s -g %s > %s' % (dupBedFile, mmulGenome, shuffledFile)
+#       print (cmd)
+        runCMD(cmd)
+    
+        #####Intersect with Ensembl gene models (6/23/2018)
+        genebedfile = '/scratch/jmkidd_fluxod/umscholj/controls/window-counts/1kb_window/ensGene_Macaca_mulatta.Mmul_8.0.1.92.chr.gtf'
+       
+        #### genebedfile = '/scratch/jmkidd_fluxod/umscholj/CNV/annovar/db/Macaca_mulatta.Mmul_8.0.1.92.chr.longest-transcript-length.genes.gtf' ### Only using the LONGEST ENSEMBL GENES to do annotation
+        outFile = workDir + 'permutations/%s_%iwindow_intersect_ensembl_%i.txt' % (file, windowSize, i)
+        do_window_intersects(shuffledFile, genebedfile, int(windowSize), outFile)
+        
+#       cmd1 = 'rm %s' % (shuffledFile)
+#       runCMD(cmd1)
+    
+        #Parse the intersect file with Ensembl genes from above
+        ensGDict = {}
+        ensGDict, geneLengths = parse_shuffle_intersect(ensGDict,outFile, windowSize) # shuffled_geneLengths is a list keeping track of all intersected gene lengths after shuffling duplication locations (one round shuffling)
+        
+#       cmd2 = 'rm %s' % (outFile)
+#       runCMD(cmd2)
+        
